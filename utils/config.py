@@ -30,6 +30,9 @@ class NetworkConfig:
     dim_heads: int = 32
     patch_size: list[int] = field(default_factory=lambda: [4, 4])
     expansion_factor: int = 2
+    separable_embed: bool = False
+    metadata_embed: bool = False
+    dim_metadata: int = 8
 
 
 @dataclass
@@ -46,6 +49,10 @@ class TrainerConfig:
     max_steps: int = 500
     rollout_steps: int = 4
     val_time_slice: dict[str, Any] | None = None
+    predict_steps: int = 20
+    predict_stride: int = 5
+    train_rollout_steps: int = 1
+    pre_steps: int = 0
 
 
 @dataclass

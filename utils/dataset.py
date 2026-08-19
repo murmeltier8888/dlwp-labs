@@ -44,8 +44,15 @@ class WeatherDataset(torch.utils.data.Dataset):
         self._ds = ds
         self._lat = ds["latitude"].values
         self._lon = ds["longitude"].values
+        self.time = ds["time"].values
 
         self.tensor = self.to_tensor(ds)
+
+        times = ds["time"].values
+        ts_ns = times.astype("datetime64[ns]")
+        hours = ts_ns.astype("datetime64[h]").astype(int) % 24
+        dayofyears = ((ts_ns - ts_ns.astype("datetime64[Y]")) / np.timedelta64(1, "D")).astype(int) + 1
+        self._time_hours = torch.tensor((dayofyears - 1) * 24 + hours, dtype=torch.float32)
 
     def to_tensor(self, ds: xr.Dataset) -> torch.Tensor:
         arrays = []
@@ -78,5 +85,5 @@ class WeatherDataset(torch.utils.data.Dataset):
     def __len__(self) -> int:
         return self.tensor.shape[1] - self.config.sequence_length + 1
 
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        return self.tensor[:, idx: idx + self.config.sequence_length]
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.tensor[:, idx: idx + self.config.sequence_length], self._time_hours[idx]

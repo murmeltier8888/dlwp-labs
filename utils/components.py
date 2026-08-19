@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
-from einops import rearrange
+from einops import rearrange, repeat
 from einops.layers.torch import EinMix
 
 from utils.config import NetworkConfig
@@ -58,36 +60,77 @@ class TransformerBlock(nn.Module):
         return x
 
 
+def sincos_embedding(coordinate: torch.Tensor, period: float, dim: int) -> torch.Tensor:
+    """Sine and cosine features of a periodic coordinate at the harmonics of its period."""
+    freqs = 2 * math.pi / period * torch.arange(1, dim // 2 + 1, device=coordinate.device, dtype=coordinate.dtype)
+    angles = torch.einsum("..., f -> ... f", coordinate, freqs)
+    return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+
+
 class ViT(nn.Module):
     def __init__(self, config: NetworkConfig, num_variables: int, field_size: tuple[int, int]) -> None:
         super().__init__()
         self.num_variables = num_variables
+        self.config = config
         hh, ww = config.patch_size
         H, W = field_size
         self.h, self.w = H // hh, W // ww
         self.hh, self.ww = hh, ww
 
-        self.to_tokens = EinMix(
-            "b v (h hh) (w ww) -> b (h w) d",
-            weight_shape="v hh ww d",
-            v=num_variables, hh=hh, ww=ww, d=config.dim,
-        )
-        self.pos_emb = nn.Parameter(torch.randn(self.h * self.w, config.dim) * 0.02)
-        self.blocks = nn.ModuleList([
-            TransformerBlock(config.dim, config.num_heads, config.dim_heads, config.expansion_factor)
-            for _ in range(config.num_layers)
-        ])
-        self.norm = nn.RMSNorm(config.dim)
-        self.to_fields = EinMix(
-            "b (h w) d -> b v (h hh) (w ww)",
-            weight_shape="v hh ww d",
-            v=num_variables, h=self.h, w=self.w, hh=hh, ww=ww, d=config.dim,
-        )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if config.separable_embed:
+            total_dim = num_variables * config.dim
+            self.to_tokens = EinMix(
+                "b v (h hh) (w ww) -> b (h w) (v d)",
+                weight_shape="v hh ww d",
+                v=num_variables, hh=hh, ww=ww, d=config.dim,
+            )
+            self.pos_emb = nn.Parameter(torch.randn(self.h * self.w, total_dim) * 0.02)
+            self.blocks = nn.ModuleList([
+                TransformerBlock(total_dim, config.num_heads, config.dim_heads, config.expansion_factor)
+                for _ in range(config.num_layers)
+            ])
+            self.norm = nn.RMSNorm(total_dim)
+            self.to_fields = EinMix(
+                "b (h w) (v d) -> b v (h hh) (w ww)",
+                weight_shape="v hh ww d",
+                v=num_variables, h=self.h, w=self.w, hh=hh, ww=ww, d=config.dim,
+            )
+        else:
+            self.to_tokens = EinMix(
+                "b v (h hh) (w ww) -> b (h w) d",
+                weight_shape="v hh ww d",
+                v=num_variables, hh=hh, ww=ww, d=config.dim,
+            )
+            self.pos_emb = nn.Parameter(torch.randn(self.h * self.w, config.dim) * 0.02)
+            self.blocks = nn.ModuleList([
+                TransformerBlock(config.dim, config.num_heads, config.dim_heads, config.expansion_factor)
+                for _ in range(config.num_layers)
+            ])
+            self.norm = nn.RMSNorm(config.dim)
+            self.to_fields = EinMix(
+                "b (h w) d -> b v (h hh) (w ww)",
+                weight_shape="v hh ww d",
+                v=num_variables, h=self.h, w=self.w, hh=hh, ww=ww, d=config.dim,
+            )
+
+        self.metadata_embed = config.metadata_embed
+        if self.metadata_embed:
+            dim_meta = config.dim_metadata
+            total_dim = num_variables * config.dim if config.separable_embed else config.dim
+            self.time_proj = nn.Linear(2 * dim_meta, total_dim)
+
+    def forward(self, x: torch.Tensor, time: torch.Tensor | None = None) -> torch.Tensor:
         b = x.shape[0]
         tokens = self.to_tokens(x)
         tokens = tokens + self.pos_emb.unsqueeze(0)
+
+        if self.metadata_embed and time is not None:
+            meta = torch.cat([
+                sincos_embedding(time, 24.0, self.config.dim_metadata),
+                sincos_embedding(time, 365.25 * 24.0, self.config.dim_metadata),
+            ], dim=-1)
+            tokens = tokens + self.time_proj(meta).unsqueeze(1)
+
         for block in self.blocks:
             tokens = block(tokens)
         tokens = self.norm(tokens)
@@ -95,5 +138,5 @@ class ViT(nn.Module):
 
 
 class Persistence(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
         return x
