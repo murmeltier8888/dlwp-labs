@@ -18,18 +18,31 @@ from utils.loss_fn import MSE, WeightedMSE
 
 
 class ForecastModule(L.LightningModule):
+    """Lightning wrapper for the weather forecasting model.
+
+    Handles training (single-step or autoregressive rollout), validation (multi-step rollout),
+    prediction (long roll-out for evaluation year), and the data loaders.
+
+    All batch tensors carry the axes (batch, variable, time, latitude, longitude) unless noted.
+    """
+
     def __init__(self, config: Config) -> None:
         super().__init__()
-        self.save_hyperparameters(config.to_dict())
+        self.save_hyperparameters(config.to_dict())    # stores config as hyperparameters for checkpointing
         self.config = config
 
+        # The training window must be long enough for the autoregressive rollout
         assert config.dataset.sequence_length >= config.trainer.train_rollout_steps + 1, (
             f"sequence_length ({config.dataset.sequence_length}) must be >= "
             f"train_rollout_steps + 1 ({config.trainer.train_rollout_steps + 1})"
         )
 
+        # --- Datasets ---
+        # Training dataset: full years, windows of `sequence_length` states
         self.train_dataset = WeatherDataset(config.dataset)
 
+        # Validation dataset: evaluation year, windows of `rollout_steps + 1` states
+        # (one initial state + rollout_steps targets for multi-step validation)
         val_config = dataclasses.replace(
             config.dataset,
             time_slice=config.trainer.val_time_slice,
@@ -37,6 +50,7 @@ class ForecastModule(L.LightningModule):
         )
         self.val_dataset = WeatherDataset(val_config)
 
+        # --- Model ---
         num_variables = len(config.dataset.variables)
         H, W = self.train_dataset.tensor.shape[2], self.train_dataset.tensor.shape[3]
 
@@ -45,11 +59,14 @@ class ForecastModule(L.LightningModule):
         else:
             self.model = Persistence()
 
-        self._data_step = 6.0  # hours between consecutive timesteps (six-hourly data)
+        # Time step between consecutive states in hours (six-hourly ERA5 data)
+        self._data_step = 6.0
 
+        # --- Loss ---
+        # Training loss: MSE or WeightedMSE depending on config
         if config.objective.name == "weighted_mse":
             self.loss = WeightedMSE(
-                latitude=self.train_dataset._lat,
+                latitude=self.train_dataset._lat,       # (H,) latitude in degrees
                 variable_weights=config.objective.kwargs.get("variable_weights"),
                 latitude_weighting=config.objective.kwargs.get("latitude_weighting", True),
                 variables=config.dataset.variables,
@@ -57,62 +74,118 @@ class ForecastModule(L.LightningModule):
         else:
             self.loss = MSE(**config.objective.kwargs)
 
+        # Validation loss is always plain MSE for fair comparison across runs
         self.val_loss = MSE()
         self.automatic_optimization = isinstance(self.model, ViT)
 
     def training_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
+        """Single-step or autoregressive training.
+
+        With train_rollout_steps=1 (default): standard one-step prediction.
+        With train_rollout_steps>1: applies the model repeatedly on its own output,
+        the loss is the mean over the rollout steps, gradients flow through the whole chain.
+
+        Args:
+            batch: tuple of (states, time)
+                states: (b, v, seq, H, W) — a window of seq consecutive states
+                time:   (b,) — hours since Jan 1 for the first state
+        Returns:
+            scalar loss
+        """
         states, time = batch
+        # During pre_steps phase (global_step < pre_steps), use single-step training;
+        # after that, switch to the full rollout
         steps = 1 if self.global_step < self.config.trainer.pre_steps else self.config.trainer.train_rollout_steps
-        x = states[:, :, 0]
-        t = time
+
+        x = states[:, :, 0]                            # (b, v, H, W) — initial state
+        t = time                                        # (b,) — time of the initial state
         total_loss = torch.tensor(0.0, device=x.device)
         for k in range(steps):
-            pred = self.model(x, time=t)
-            target = states[:, :, k + 1]
+            pred = self.model(x, time=t)               # (b, v, H, W) — one-step prediction
+            target = states[:, :, k + 1]                # (b, v, H, W) — ground truth at step k+1
             total_loss = total_loss + self.loss(pred, target)
-            x = pred
+            x = pred                                    # feed prediction back as input (autoregressive)
             if t is not None:
-                t = t + self._data_step
-        loss = total_loss / steps
+                t = t + self._data_step                 # advance time by one data step (6 hours)
+        loss = total_loss / steps                       # mean loss over the rollout
         self.log("train/loss", loss, prog_bar=True)
         return loss
 
     def validation_step(self, batch: torch.Tensor, batch_idx: int) -> None:
+        """Multi-step autoregressive validation.
+
+        Rolls out the model for `rollout_steps` steps from the initial state,
+        logging the loss at each step separately (val/loss_step1, val/loss_step2, ...).
+
+        Args:
+            batch: tuple of (states, time)
+                states: (b, v, rollout_steps+1, H, W) — initial state + rollout_steps targets
+                time:   (b,) — hours since Jan 1 for the initial state
+        """
         states, time = batch
-        x = states[:, :, 0]
+        x = states[:, :, 0]                            # (b, v, H, W) — initial state
         t = time
         for k in range(1, self.config.trainer.rollout_steps + 1):
-            x = self.model(x, time=t)
-            target = states[:, :, k]
+            x = self.model(x, time=t)                  # (b, v, H, W) — predicted state at step k
+            target = states[:, :, k]                    # (b, v, H, W) — ground truth at step k
             loss = self.val_loss(x, target)
             self.log(f"val/loss_step{k}", loss, prog_bar=True)
             if t is not None:
                 t = t + self._data_step
 
     def forecast(self, x: torch.Tensor, steps: int, time: torch.Tensor | None = None) -> torch.Tensor:
+        """Autoregressive roll-out: apply the model `steps` times from an initial state.
+
+        Args:
+            x:     (b, v, H, W) — initial state
+            steps: number of autoregressive steps
+            time:  (b,) or None — time of the initial state
+        Returns:
+            (b, v, steps, H, W) — the predicted states at steps 1..steps
+        """
         preds = []
-        h = x
+        h = x                                          # current state, starts as initial
         t = time
         for _ in range(steps):
-            h = self.model(h, time=t)
+            h = self.model(h, time=t)                  # (b, v, H, W) — next prediction
             preds.append(h)
             if t is not None:
                 t = t + self._data_step
-        return torch.stack(preds, dim=2)
+        return torch.stack(preds, dim=2)               # (b, v, steps, H, W)
 
     def predict_step(self, batch: torch.Tensor, batch_idx: int) -> torch.Tensor:
+        """Trainer.predict entry point: roll out from the initial state for predict_steps.
+
+        Args:
+            batch: tuple of (states, time) from predict_dataloader
+                states: (b, v, predict_steps+1, H, W)
+                time:   (b,)
+        Returns:
+            (b, v, predict_steps, H, W) on CPU
+        """
         states, time = batch
         return self.forecast(states[:, :, 0], self.config.trainer.predict_steps, time=time).cpu()
 
     def predict_dataloader(self) -> DataLoader:
+        """DataLoader for the evaluation year predictions.
+
+        Creates a dataset with sequence_length = predict_steps + 1 (enough for one
+        initial state + predict_steps targets), then takes every predict_stride-th
+        window via a Subset. With predict_stride=5 on six-hourly data, the
+        initialisations are 30 hours apart, cycling through 00, 06, 12, and 18 UTC.
+
+        Returns:
+            DataLoader of (states, time) tuples, unshuffled
+        """
         cfg = self.config.trainer
-        predict_seq_length = cfg.predict_steps + 1
+        predict_seq_length = cfg.predict_steps + 1     # initial state + predict_steps targets
         pred_dataset_cfg = dataclasses.replace(
             self.config.dataset,
             time_slice=cfg.val_time_slice,
             sequence_length=predict_seq_length,
         )
         pred_dataset = WeatherDataset(pred_dataset_cfg)
+        # Every predict_stride-th starting position: e.g. stride=5 -> indices 0, 5, 10, ...
         indices = list(range(0, len(pred_dataset), cfg.predict_stride))
         subset = Subset(pred_dataset, indices)
         return DataLoader(
@@ -123,8 +196,9 @@ class ForecastModule(L.LightningModule):
         )
 
     def configure_optimizers(self):
+        """AdamW optimizer with cosine annealing schedule."""
         if not self.automatic_optimization:
-            return []
+            return []                                   # persistence model has no trainable parameters
         cfg = self.config.trainer
         optimizer = torch.optim.AdamW(
             self.parameters(),
@@ -141,26 +215,36 @@ class ForecastModule(L.LightningModule):
         }
 
     def train_dataloader(self) -> DataLoader:
-        cfg = self.config.dataset
         return DataLoader(
             self.train_dataset,
-            batch_size=cfg.batch_size,
-            num_workers=cfg.num_workers,
+            batch_size=self.config.dataset.batch_size,
+            num_workers=self.config.dataset.num_workers,
             shuffle=True,
         )
 
     def val_dataloader(self) -> DataLoader:
-        cfg = self.config.dataset
         return DataLoader(
             self.val_dataset,
-            batch_size=cfg.batch_size,
-            num_workers=cfg.num_workers,
+            batch_size=self.config.dataset.batch_size,
+            num_workers=self.config.dataset.num_workers,
             shuffle=False,
         )
 
 
 def plot_metrics(log_dir: str, ax=None, label=None):
-    """Plot train/loss and val/loss_step1 from a run's metrics.csv."""
+    """Plot train/loss and val/loss_step1 from a run's metrics.csv.
+
+    The CSV is written by CSVLogger for every value passed to self.log.
+    train/loss is plotted as a line (with 10-step rolling mean) and raw scatter;
+    val/loss_step1 is plotted as x-markers.
+
+    Args:
+        log_dir: path to the run's log directory (contains metrics.csv)
+        ax:      matplotlib axis to draw on (created if None)
+        label:   label for the legend
+    Returns:
+        the matplotlib axis
+    """
     import matplotlib.pyplot as plt
 
     metrics_path = Path(log_dir) / "metrics.csv"
@@ -193,7 +277,11 @@ def plot_metrics(log_dir: str, ax=None, label=None):
 
 
 class LossCurve(Callback):
+    """Callback that saves the logger and plots the loss curve at the end of training.
+
+    Attach to every Trainer: callbacks=[LossCurve()]
+    """
     def on_train_end(self, trainer: L.Trainer, module: L.LightningModule) -> None:
         if trainer.logger is not None:
-            trainer.logger.save()
-            plot_metrics(trainer.logger.log_dir)
+            trainer.logger.save()                       # flush metrics.csv to disk
+            plot_metrics(trainer.logger.log_dir)        # plot train/loss and val/loss_step1
