@@ -10,6 +10,7 @@ The code you write accumulates in `utils/`, so that by the end the repository ho
 01_data_and_verification.ipynb   ERA5 in xarray, climatologies, tendencies, the persistence forecast, and its verification
 02_dl_pipeline.ipynb             the training pipeline: Dataset, loss, Vision Transformer, LightningModule, and configuration
 03_inductive_biases.ipynb        checkpoints and forecasts as xarray, then loss weights, roll-out training, per-variable embeddings, and the time of day
+04_ensembles.ipynb               the empirical score, a noise input, and the verification of an ensemble
 utils/                           the package the labs fill in; empty modules for now
 configs/                         the configuration files the notebooks run from
 environment.yaml                 the conda environment every notebook runs in
